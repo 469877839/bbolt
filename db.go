@@ -18,6 +18,11 @@ import (
 // The time elapsed between consecutive file locking attempts.
 const flockRetryTimeout = 50 * time.Millisecond
 
+// freelistCacheWriteInterval is the minimum interval between two background
+// writes of the freelist cache while the database is open. It is a variable
+// (instead of a constant) so that tests can tune it.
+var freelistCacheWriteInterval = time.Minute
+
 // FreelistType is the type of the freelist backend
 type FreelistType string
 
@@ -58,6 +63,14 @@ type DB struct {
 	// write performance under normal operation, but requires a full database
 	// re-sync during recovery.
 	NoFreelistSync bool
+
+	// When true (and NoFreelistSync is set), bbolt maintains a best-effort
+	// cache of the free page list in a sidecar file next to the database
+	// file, so that reopening the database usually doesn't require a full
+	// file scan to rebuild the freelist. The cache is only a hint: it is
+	// validated against the committed meta page before use and discarded
+	// on any mismatch, in which case bbolt falls back to the full scan.
+	FreelistCache bool
 
 	// FreelistType sets the backend freelist type. There are two options. Array which is simple but endures
 	// dramatic performance degradation if database is large and fragmentation in freelist is common.
@@ -137,6 +150,11 @@ type DB struct {
 	freelist     fl.Interface
 	freelistLoad sync.Once
 
+	freelistCacheMu        sync.Mutex
+	freelistCacheWriting   bool
+	freelistCacheLastWrite time.Time
+	freelistCacheWg        sync.WaitGroup
+
 	pagePool sync.Pool
 
 	batchMu sync.Mutex
@@ -188,6 +206,7 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 	db.NoGrowSync = options.NoGrowSync
 	db.MmapFlags = options.MmapFlags
 	db.NoFreelistSync = options.NoFreelistSync
+	db.FreelistCache = options.FreelistCache
 	db.PreLoadFreelist = options.PreLoadFreelist
 	db.FreelistType = options.FreelistType
 	db.Mlock = options.Mlock
@@ -423,8 +442,14 @@ func (db *DB) loadFreelist() {
 	db.freelistLoad.Do(func() {
 		db.freelist = newFreelist(db.FreelistType)
 		if !db.hasSyncedFreelist() {
-			// Reconstruct free list by scanning the DB.
-			db.freelist.Init(db.freepages())
+			if ids, ok := db.loadFreelistFromCache(); ok {
+				// The cache matched the committed meta page, so it
+				// describes exactly the current free pages.
+				db.freelist.Init(ids)
+			} else {
+				// Reconstruct free list by scanning the DB.
+				db.freelist.Init(db.freepages())
+			}
 		} else {
 			// Read free list from freelist page.
 			db.freelist.Read(db.page(db.meta().Freelist()))
@@ -437,6 +462,50 @@ func (db *DB) loadFreelist() {
 
 func (db *DB) hasSyncedFreelist() bool {
 	return db.meta().Freelist() != common.PgidNoFreelist
+}
+
+// loadFreelistFromCache attempts to load the free page list from the sidecar
+// cache file. The cache is only a hint: it is cross-checked against the
+// committed meta page (transaction id and high water mark) and discarded on
+// any inconsistency, in which case ok is false and the caller must fall back
+// to scanning the whole database file.
+func (db *DB) loadFreelistFromCache() (ids common.Pgids, ok bool) {
+	if !db.FreelistCache {
+		return nil, false
+	}
+
+	lg := db.Logger()
+	path := freelistCachePath(db.path)
+	data, err := readFreelistCacheFile(path, db.pageSize)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			lg.Infof("freelist cache file %q does not exist; falling back to a full scan of the db file", path)
+		} else {
+			lg.Warningf("freelist cache file %q is unusable (%v); falling back to a full scan of the db file", path, err)
+		}
+		return nil, false
+	}
+
+	// The cache is only valid if the database hasn't committed anything
+	// since the cache snapshot was taken. Comparing the transaction id and
+	// the high water mark (the allocated page boundary) against the current
+	// meta page guarantees that no cached page can still be referenced.
+	m := db.meta()
+	if data.txid != m.Txid() || data.highWater != m.Pgid() {
+		lg.Warningf("freelist cache file %q is stale (cache txid: %d, high water mark: %d; db txid: %d, high water mark: %d); falling back to a full scan of the db file",
+			path, data.txid, data.highWater, m.Txid(), m.Pgid())
+		return nil, false
+	}
+	for _, id := range data.ids {
+		if id < 2 || id >= data.highWater {
+			lg.Warningf("freelist cache file %q contains out-of-range page id %d (high water mark: %d); falling back to a full scan of the db file",
+				path, id, data.highWater)
+			return nil, false
+		}
+	}
+
+	lg.Infof("loaded freelist from cache file %q: %d free pages at txid %d", path, len(data.ids), data.txid)
+	return data.ids, true
 }
 
 func (db *DB) fileSize() (int, error) {
@@ -711,6 +780,10 @@ func (db *DB) close() error {
 
 	db.opened = false
 
+	// Persist a freelist cache so that the next open can skip the full
+	// file scan. This must happen before the freelist is torn down.
+	db.persistFreelistCache()
+
 	db.freelist = nil
 
 	// Clear ops.
@@ -745,6 +818,67 @@ func (db *DB) close() error {
 		return errs[0]
 	}
 	return nil
+}
+
+// persistFreelistCache writes the current free page list into the sidecar
+// cache file. It is a no-op unless the database was opened in read-write
+// mode with both NoFreelistSync and FreelistCache enabled. Failures are
+// logged but never prevent the database from closing: the cache is only a
+// hint and may be lost at any time.
+func (db *DB) persistFreelistCache() {
+	if !db.FreelistCache || !db.NoFreelistSync || db.readOnly || db.freelist == nil {
+		return
+	}
+
+	// Wait for any asynchronous cache write so that this final (freshest)
+	// snapshot is the one that lands on disk last.
+	db.freelistCacheWg.Wait()
+
+	m := db.meta()
+	ids := make(common.Pgids, db.freelist.Count())
+	db.freelist.Copyall(ids)
+	if err := writeFreelistCacheFile(freelistCachePath(db.path), db.pageSize, m.Txid(), m.Pgid(), ids); err != nil {
+		db.Logger().Warningf("failed to write freelist cache file for db %q: %v", db.path, err)
+	}
+}
+
+// maybeWriteFreelistCacheAsync snapshots the current free page list and
+// writes it to the sidecar cache file in the background. It is throttled to
+// at most one write per freelistCacheWriteInterval so that the commit
+// throughput stays unaffected: the commit path only pays for an in-memory
+// copy of the free page ids, and only when the throttle fires. The snapshot
+// is taken while holding the writer lock, so it is consistent with the last
+// committed meta page. A crash may lose the most recent cache update; the
+// next open then simply falls back to a full scan.
+func (db *DB) maybeWriteFreelistCacheAsync() {
+	if !db.FreelistCache || !db.NoFreelistSync {
+		return
+	}
+
+	db.freelistCacheMu.Lock()
+	if db.freelistCacheWriting || time.Since(db.freelistCacheLastWrite) < freelistCacheWriteInterval {
+		db.freelistCacheMu.Unlock()
+		return
+	}
+	db.freelistCacheWriting = true
+	db.freelistCacheLastWrite = time.Now()
+	db.freelistCacheMu.Unlock()
+
+	m := db.meta()
+	ids := make(common.Pgids, db.freelist.Count())
+	db.freelist.Copyall(ids)
+	txid, highWater, pageSize, path := m.Txid(), m.Pgid(), db.pageSize, freelistCachePath(db.path)
+
+	db.freelistCacheWg.Add(1)
+	go func() {
+		defer db.freelistCacheWg.Done()
+		db.freelistCacheMu.Lock()
+		db.freelistCacheWriting = false
+		db.freelistCacheMu.Unlock()
+		if err := writeFreelistCacheFile(path, pageSize, txid, highWater, ids); err != nil {
+			db.Logger().Warningf("failed to write freelist cache file for db %q: %v", path, err)
+		}
+	}()
 }
 
 // Begin starts a new transaction.
@@ -868,6 +1002,7 @@ func (db *DB) beginRWTx() (*Tx, error) {
 	t.init(db)
 	db.rwtx = t
 	db.freelist.ReleasePendingPages()
+	db.maybeWriteFreelistCacheAsync()
 	return t, nil
 }
 
@@ -1331,6 +1466,21 @@ type Options struct {
 	// under normal operation, but requires a full database re-sync during recovery.
 	NoFreelistSync bool
 
+	// FreelistCache enables a best-effort cache of the free page list in a
+	// sidecar file ("<db path>.freelistcache") next to the database file.
+	// It only takes effect together with NoFreelistSync and allows reopening
+	// the database without scanning the whole file to rebuild the freelist.
+	//
+	// The cache is only a hint: before using it, bbolt validates it against
+	// the committed meta page and falls back to a full scan on any mismatch
+	// or corruption, so a stale, truncated or deleted cache is always safe.
+	// The cache is written on a clean Close and, throttled, in the
+	// background while the database is open; it is never written on the
+	// commit path, so commit throughput is unaffected.
+	//
+	// The default value is false, which keeps the previous behavior.
+	FreelistCache bool
+
 	// PreLoadFreelist sets whether to load the free pages when opening
 	// the db file. Note when opening db in write mode, bbolt will always
 	// load the free pages.
@@ -1400,8 +1550,8 @@ func (o *Options) String() string {
 		return "{}"
 	}
 
-	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t}",
-		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics)
+	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, FreelistCache: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t}",
+		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.FreelistCache, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics)
 
 }
 

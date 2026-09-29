@@ -48,6 +48,34 @@ func (t *shared) Count() int {
 	return t.FreeCount() + t.PendingCount()
 }
 
+func (t *shared) FreeTailRun(hwm common.Pgid) common.Pgid {
+	ids := t.freePageIds()
+	if len(ids) == 0 || ids[len(ids)-1] != hwm-1 {
+		return hwm
+	}
+	i := len(ids) - 1
+	for i > 0 && ids[i-1] == ids[i]-1 {
+		i--
+	}
+	return ids[i]
+}
+
+func (t *shared) DiscardFreePagesFrom(start common.Pgid) common.Pgids {
+	ids := t.freePageIds()
+	idx := sort.Search(len(ids), func(i int) bool { return ids[i] >= start })
+
+	removed := make(common.Pgids, len(ids)-idx)
+	copy(removed, ids[idx:])
+
+	kept := make(common.Pgids, idx)
+	copy(kept, ids[:idx])
+
+	// Init rebuilds the free list (and the free/pending cache via reindex)
+	// from the kept ids for both the array and the hashmap backend.
+	t.Init(kept)
+	return removed
+}
+
 func (t *shared) Freed(pgId common.Pgid) bool {
 	_, ok := t.cache[pgId]
 	return ok

@@ -137,6 +137,12 @@ type DB struct {
 	freelist     fl.Interface
 	freelistLoad sync.Once
 
+	// openReaderPgids tracks the high water mark (meta.pgid) of every open
+	// read-only transaction, so that Reclaim can tell whether any reader
+	// may still reference pages at the tail of the data file.
+	// Guarded by metalock.
+	openReaderPgids map[common.Pgid]int
+
 	pagePool sync.Pool
 
 	batchMu sync.Mutex
@@ -201,6 +207,8 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 	if !options.NoStatistics {
 		db.stats = new(Stats)
 	}
+
+	db.openReaderPgids = make(map[common.Pgid]int)
 
 	if options.Logger == nil {
 		db.logger = getDiscardLogger()
@@ -822,6 +830,10 @@ func (db *DB) beginTx() (*Tx, error) {
 		db.freelist.AddReadonlyTXID(t.meta.Txid())
 	}
 
+	// Register the transaction's high water mark so that Reclaim knows
+	// which tail pages may still be referenced by this reader.
+	db.openReaderPgids[t.meta.Pgid()]++
+
 	// Unlock the meta pages.
 	db.metalock.Unlock()
 
@@ -881,6 +893,13 @@ func (db *DB) removeTx(tx *Tx) {
 
 	if db.freelist != nil {
 		db.freelist.RemoveReadonlyTXID(tx.meta.Txid())
+	}
+
+	// Unregister the transaction's high water mark.
+	if pgid := tx.meta.Pgid(); db.openReaderPgids[pgid] > 1 {
+		db.openReaderPgids[pgid]--
+	} else {
+		delete(db.openReaderPgids, pgid)
 	}
 
 	// Unlock the meta pages.

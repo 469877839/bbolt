@@ -620,3 +620,107 @@ func newTestFreelist() Interface {
 
 	return NewArrayFreelist()
 }
+
+// Ensure that FreeTailRun correctly identifies the contiguous run of free
+// pages at the end of the file.
+func TestFreelist_FreeTailRun(t *testing.T) {
+	testCases := []struct {
+		name     string
+		freeIds  []common.Pgid
+		hwm      common.Pgid
+		expected common.Pgid
+	}{
+		{
+			name:     "empty freelist",
+			freeIds:  nil,
+			hwm:      10,
+			expected: 10,
+		},
+		{
+			name:     "tail page not free",
+			freeIds:  []common.Pgid{3, 4, 5},
+			hwm:      10,
+			expected: 10,
+		},
+		{
+			name:     "single tail page",
+			freeIds:  []common.Pgid{3, 9},
+			hwm:      10,
+			expected: 9,
+		},
+		{
+			name:     "contiguous tail run",
+			freeIds:  []common.Pgid{3, 5, 6, 7, 8, 9},
+			hwm:      10,
+			expected: 5,
+		},
+		{
+			name:     "whole freelist is the tail",
+			freeIds:  []common.Pgid{2, 3, 4, 5, 6, 7, 8, 9},
+			hwm:      10,
+			expected: 2,
+		},
+		{
+			name:     "gap right before the tail",
+			freeIds:  []common.Pgid{7, 9},
+			hwm:      10,
+			expected: 9,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestFreelist()
+			f.Init(tc.freeIds)
+			require.Equal(t, tc.expected, f.FreeTailRun(tc.hwm))
+		})
+	}
+}
+
+// Ensure that DiscardFreePagesFrom removes exactly the free pages at or
+// beyond the given page id and leaves pending pages untouched.
+func TestFreelist_DiscardFreePagesFrom(t *testing.T) {
+	f := newTestFreelist()
+	f.Init([]common.Pgid{3, 4, 7, 8, 9, 12})
+
+	// Add a pending page beyond the discard point; it must survive.
+	f.Free(100, common.NewPage(15, 0, 0, 0))
+
+	removed := f.DiscardFreePagesFrom(8)
+	require.Equal(t, common.Pgids{8, 9, 12}, removed)
+
+	require.Equal(t, 3, f.FreeCount())
+	require.Equal(t, 1, f.PendingCount())
+
+	// The discarded pages must no longer be tracked, everything else must be.
+	for _, id := range []common.Pgid{3, 4, 7, 15} {
+		require.True(t, f.Freed(id), "page %d should still be tracked", id)
+	}
+	for _, id := range []common.Pgid{8, 9, 12} {
+		require.False(t, f.Freed(id), "page %d should have been discarded", id)
+	}
+
+	// The discarded pages must not be handed out again; allocation should
+	// only come from the remaining free pages.
+	var allocated []common.Pgid
+	for {
+		id := f.Allocate(200, 1)
+		if id == 0 {
+			break
+		}
+		allocated = append(allocated, id)
+	}
+	sort.Sort(common.Pgids(allocated))
+	require.Equal(t, []common.Pgid{3, 4, 7}, allocated)
+}
+
+// Ensure that discarding the whole free list works.
+func TestFreelist_DiscardFreePagesFrom_All(t *testing.T) {
+	f := newTestFreelist()
+	f.Init([]common.Pgid{5, 6, 7})
+
+	removed := f.DiscardFreePagesFrom(2)
+	require.Equal(t, common.Pgids{5, 6, 7}, removed)
+	require.Equal(t, 0, f.FreeCount())
+	require.Equal(t, common.Pgid(0), f.Allocate(200, 1))
+}

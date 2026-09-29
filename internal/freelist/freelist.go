@@ -30,6 +30,17 @@ type Interface interface {
 	// Count returns the number of free and pending pages.
 	Count() int
 
+	// FreeTailRun returns the smallest page id such that all pages in
+	// [start, hwm) are free (i.e. the contiguous run of free pages at the
+	// end of the file, hwm being the high water mark). It returns hwm if
+	// the last page (hwm-1) is not free.
+	FreeTailRun(hwm common.Pgid) common.Pgid
+
+	// DiscardFreePagesFrom removes every free page with id greater than or
+	// equal to start from the free list and returns the removed ids in
+	// ascending order. Pending pages are not affected.
+	DiscardFreePagesFrom(start common.Pgid) common.Pgids
+
 	// FreeCount returns the number of free pages.
 	FreeCount() int
 

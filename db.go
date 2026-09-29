@@ -137,6 +137,10 @@ type DB struct {
 	freelist     fl.Interface
 	freelistLoad sync.Once
 
+	// Path of the optional freelist cache file. Empty means the cache is
+	// disabled, which is the default.
+	freelistCachePath string
+
 	pagePool sync.Pool
 
 	batchMu sync.Mutex
@@ -242,6 +246,15 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 		return nil, err
 	}
 	db.path = db.file.Name()
+
+	// Enable the optional freelist cache. It is only ever used when the
+	// freelist is not synced into the db file (NoFreelistSync).
+	if options.FreelistCache {
+		db.freelistCachePath = options.FreelistCachePath
+		if db.freelistCachePath == "" {
+			db.freelistCachePath = defaultFreelistCachePath(db.path)
+		}
+	}
 
 	// Lock file so that other processes using Bolt in read-write mode cannot
 	// use the database  at the same time. This would cause corruption since
@@ -423,8 +436,21 @@ func (db *DB) loadFreelist() {
 	db.freelistLoad.Do(func() {
 		db.freelist = newFreelist(db.FreelistType)
 		if !db.hasSyncedFreelist() {
-			// Reconstruct free list by scanning the DB.
-			db.freelist.Init(db.freepages())
+			// Try the advisory freelist cache first; it is only trusted
+			// if it matches the current meta txid and high-water mark.
+			ids, ok := db.readFreelistCache()
+			if !ok {
+				// Reconstruct free list by scanning the DB.
+				txidBefore := db.meta().Txid()
+				ids = db.freepages()
+				// Re-arm the cache with the scan result, but only if the
+				// db didn't change underneath us while scanning (possible
+				// when another process has the db open in read-write mode).
+				if m := db.meta(); m.Txid() == txidBefore {
+					db.writeFreelistCache(ids, m.Txid(), m.Pgid())
+				}
+			}
+			db.freelist.Init(ids)
 		} else {
 			// Read free list from freelist page.
 			db.freelist.Read(db.page(db.meta().Freelist()))
@@ -710,6 +736,20 @@ func (db *DB) close() error {
 	}
 
 	db.opened = false
+
+	// Persist the freelist cache on a clean shutdown so that the next open
+	// can skip the full scan. This is intentionally done outside of the
+	// commit path to keep commit throughput unchanged, and only for
+	// read-write opens: a read-only process may hold a snapshot older than
+	// what a concurrent writer already cached, and the newest cache wins.
+	// The write is best-effort; losing it just means the next open falls
+	// back to a full scan.
+	if !db.readOnly && db.NoFreelistSync && db.freelist != nil {
+		m := db.meta()
+		ids := make([]common.Pgid, db.freelist.Count())
+		db.freelist.Copyall(ids)
+		db.writeFreelistCache(ids, m.Txid(), m.Pgid())
+	}
 
 	db.freelist = nil
 
@@ -1331,6 +1371,22 @@ type Options struct {
 	// under normal operation, but requires a full database re-sync during recovery.
 	NoFreelistSync bool
 
+	// FreelistCache enables an advisory on-disk cache of the freelist, stored
+	// in a sidecar file next to the db. It only takes effect together with
+	// NoFreelistSync and allows reopening the db without scanning the whole
+	// file to rebuild the freelist. The cache is validated against the meta
+	// transaction id and the high-water mark on open and is ignored whenever
+	// it is missing, stale or corrupted, in which case bbolt falls back to
+	// the full scan. It is written outside of the commit path (on clean
+	// shutdown and after a fallback scan), so it does not affect commit
+	// throughput. Disabled by default.
+	FreelistCache bool
+
+	// FreelistCachePath customizes the location of the freelist cache file.
+	// It defaults to "<db path>.freelist.cache" and is ignored unless
+	// FreelistCache is set.
+	FreelistCachePath string
+
 	// PreLoadFreelist sets whether to load the free pages when opening
 	// the db file. Note when opening db in write mode, bbolt will always
 	// load the free pages.
@@ -1400,8 +1456,8 @@ func (o *Options) String() string {
 		return "{}"
 	}
 
-	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t}",
-		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics)
+	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, FreelistCache: %t, FreelistCachePath: %s, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t}",
+		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.FreelistCache, o.FreelistCachePath, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics)
 
 }
 
